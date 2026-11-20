@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Xb Pad",
+    "slug": "xb-pad",
+    "version": "0.1.0",
+    "orientation": "landscape",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#050505",
+    "android": {
+      "package": "com.ahmedsobhi.xbpad",
+      "permissions": ["VIBRATE"]
+    }
+  }
+}
