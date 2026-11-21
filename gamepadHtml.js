@@ -387,8 +387,11 @@ window.XbRtc = (function(){
             var p = j.candidate.split(' ');
             if(p.length > 4 && /\.local$/.test(p[4])){ p[4] = ip; j.candidate = p.join(' '); }
           }
-          return j;
-        });
+          j.sdpMid = String(j.sdpMid == null ? '0' : j.sdpMid);
+          j.sdpMLineIndex = String(j.sdpMLineIndex == null ? 0 : j.sdpMLineIndex);
+          return { candidate:j.candidate, sdpMid:j.sdpMid, sdpMLineIndex:j.sdpMLineIndex };
+        }).filter(function(c){ return c.candidate && c.candidate.indexOf(' udp ')>0 || /udp/i.test(c.candidate||''); });
+        out.push({ candidate:'a=end-of-candidates', sdpMid:'0', sdpMLineIndex:'0' });
         post({t:'ice', candidates:out});
       } else { setTimeout(wait,100); }
     })();

@@ -287,16 +287,20 @@ export class XhomeApi {
   async sendIce(path, candidates, cancelled) {
     const p = await this.req('POST', path + '/ice', JSON.stringify({ candidates }));
     if (!p.ok) throw new Error('فشل إرسال ICE (' + p.status + ')');
+    let last = '';
     for (let i = 0; i < 40; i++) {
       if (cancelled && cancelled()) throw new Error('تم الإلغاء');
       const r = await this.req('GET', path + '/ice');
+      last = r.status + ' ' + JSON.stringify(r.json || '').slice(0, 120);
       if (r.ok && r.status !== 204) {
-        const ex = parseExchange(r);
-        if (ex) return Array.isArray(ex) ? ex : [];
+        let ex = null;
+        try { ex = parseExchange(r); } catch (e) {}
+        if (Array.isArray(ex) && ex.length) return ex;
+        if (Array.isArray(r.json) && r.json.length) return r.json;
       }
       await sleep(1000);
     }
-    throw new Error('مفيش رد من الـ Xbox على ICE');
+    throw new Error('مفيش رد من الـ Xbox على ICE [' + last + '] [أرسلنا ' + candidates.length + ']');
   }
 
   keepalive(path) {
