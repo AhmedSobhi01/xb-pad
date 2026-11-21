@@ -35,10 +35,22 @@ jobs:
         working-directory: android
         run: ./gradlew assembleRelease --no-daemon -PreactNativeArchitectures=arm64-v8a
 
+      - name: Verify APK
+        run: |
+          set -o pipefail
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          {
+            echo "size: $(stat -c%s "$APK") bytes"
+            echo "sha256: $(sha256sum "$APK" | cut -d' ' -f1)"
+            unzip -tq "$APK"
+            "$BT/apksigner" verify --verbose "$APK"
+          } 2>&1 | tee verify.txt
+
       - name: Publish APK to a Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp android/app/build/outputs/apk/release/app-release.apk xb-pad.apk
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest xb-pad.apk --title "Xb Pad (latest)" --notes "Latest build" --target "${{ github.sha }}"
+          gh release create latest xb-pad.apk --title "Xb Pad (latest)" --notes-file verify.txt --target "${{ github.sha }}"
