@@ -1,4 +1,5 @@
-// Gamepad UI shown inside the WebView. No backticks / dollar-brace inside the HTML.
+// Gamepad UI + WebRTC client, shown inside the WebView.
+// No backticks / dollar-brace inside the HTML (it lives in a String.raw template).
 export default String.raw`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -39,7 +40,7 @@ export default String.raw`<!DOCTYPE html>
   .dp{width:11vh;height:11vh;border-radius:1.4vh;font-size:4vh}
   #bar{position:absolute;left:50%;bottom:1.2vh;transform:translateX(-50%);
     display:flex;gap:1.5vh;align-items:center;font:600 1.9vh ui-monospace,Menlo,monospace;color:#4a6a4a;direction:ltr;white-space:nowrap}
-  #status{color:#c9a227}
+  #status{color:#c9a227;padding:.8vh 1.6vh;border:1px solid var(--line);border-radius:1vh;background:#0c0c0c}
   #status.ok{color:var(--g2)}
   #warn{display:none;position:fixed;inset:0;background:#050505;z-index:9;align-items:center;justify-content:center;
     flex-direction:column;gap:12px;font-size:20px;color:var(--g2);text-align:center;direction:rtl}
@@ -78,17 +79,18 @@ export default String.raw`<!DOCTYPE html>
 
   <div class="stick" id="sR" data-k="R" style="right:31%;top:60vh;width:34vh;height:34vh"><div class="knob"></div></div>
 
-  <div id="bar"><span id="status">وضع تجربة · غير متصل</span><span id="dbg">-</span></div>
+  <div id="bar"><span id="status">غير متصل · اضغط هنا</span><span id="dbg">-</span></div>
 </div>
 
 <script>
 var S = { btn:{}, ax:{lx:0,ly:0,rx:0,ry:0} };
 var dirty = true;
+var lastSend = 0;
 function $(s){ return document.querySelector(s); }
 function post(o){ try{ if(window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(o)); }catch(e){} }
 
-window.XbTransport = { send: function(state){ post({t:'state', s:state}); } };
 window.XbStatus = function(text, ok){ var el=$('#status'); el.textContent=text; el.className = ok ? 'ok' : ''; };
+$('#status').addEventListener('click', function(){ post({t:'menu'}); });
 
 function buzz(ms){
   ms = ms || 12;
@@ -152,17 +154,263 @@ function snapshot(){
 var dbg = $('#dbg');
 setInterval(function(){
   var active = S.ax.lx||S.ax.ly||S.ax.rx||S.ax.ry;
-  if(!dirty && !active) return;
+  var held = false; for(var k in S.btn){ if(S.btn[k]) held = true; }
+  var now = Date.now();
+  var live = window.XbRtc && window.XbRtc.ready;
+  if(!dirty && !active && !held){
+    if(!(live && now-lastSend>1000)) return;
+  }
   var s = snapshot();
   if(dirty){
     var names=Object.keys(s.buttons).join(' ');
     dbg.textContent = (names||'-') + (active ? ('  L('+s.axes[0].toFixed(1)+','+s.axes[1].toFixed(1)+') R('+s.axes[2].toFixed(1)+','+s.axes[3].toFixed(1)+')') : '');
   }
   dirty=false;
-  window.XbTransport.send(s);
+  if(live){ window.XbRtc.sendState(s); lastSend = now; }
 },16);
 
 document.addEventListener('contextmenu',function(e){ e.preventDefault(); });
+</script>
+
+<script>
+/* ---------- Xbox Remote Play: WebRTC + data channels ----------
+   RN app does the HTTP calls (auth, SDP, ICE); this page only does WebRTC.
+   Protocol ported from the open-source xbox-xcloud-player. */
+window.XbRtc = (function(){
+  var api = { ready:false };
+  var pc = null, ch = {}, cand = [], seq = 0, kf = null, lastBuzz = 0;
+  var VIDEO_KBPS = 0;   // 0 = no limit. Set e.g. 500 to ask for low video bitrate.
+
+  function post(o){ try{ if(window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(o)); }catch(e){} }
+  function enc(s){ return new TextEncoder().encode(s); }
+  function uuid(){
+    try{ if(window.crypto && crypto.randomUUID) return crypto.randomUUID(); }catch(e){}
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){
+      var r=Math.random()*16|0; return (c==='x'?r:(r&3|8)).toString(16); });
+  }
+  function sendCh(name,data){
+    var c = ch[name];
+    if(!c || c.readyState !== 'open') return false;
+    try{ c.send(typeof data === 'string' ? enc(data) : data); return true; }catch(e){ return false; }
+  }
+
+  function codecPrefs(){
+    try{
+      var caps = RTCRtpReceiver.getCapabilities('video').codecs;
+      var t1=[],t2=[],t3=[],t4=[];
+      caps.forEach(function(c){
+        var m=c.mimeType, f=c.sdpFmtpLine||'';
+        if(m.indexOf('H264')>=0){
+          if(f.indexOf('profile-level-id=4d')>=0) t1.push(c);
+          else if(f.indexOf('profile-level-id=42e')>=0) t2.push(c);
+          else if(f.indexOf('profile-level-id=420')>=0) t3.push(c);
+        } else if(m.indexOf('ulpfec')>=0||m.indexOf('flexfec')>=0||m.indexOf('VP9')>=0||m.indexOf('VP8')>=0){
+          t4.push(c);
+        }
+      });
+      return t1.concat(t2,t3,t4);
+    }catch(e){ return []; }
+  }
+
+  function setBitrate(sdp,media,br){
+    var lines = sdp.split('\n'), line = -1;
+    for(var i=0;i<lines.length;i++){ if(lines[i].indexOf('m='+media)===0){ line=i; break; } }
+    if(line===-1) return sdp;
+    line++;
+    while(lines[line].indexOf('i=')===0 || lines[line].indexOf('c=')===0) line++;
+    if(lines[line].indexOf('b')===0){ lines[line]='b=AS:'+br+'\r'; return lines.join('\n'); }
+    lines.splice(line,0,'b=AS:'+br+'\r');
+    return lines.join('\n');
+  }
+  function tune(sdp){
+    try{
+      if(VIDEO_KBPS>0) sdp = setBitrate(sdp,'video',VIDEO_KBPS);
+      sdp = sdp.replace('useinbandfec=1','useinbandfec=1; stereo=1');
+    }catch(e){}
+    return sdp;
+  }
+
+  function open(name,cfg){
+    var c = pc.createDataChannel(name,cfg);
+    c.binaryType = 'arraybuffer';
+    ch[name] = c;
+    c.onopen = function(){ if(name==='message') handshake(); };
+    c.onmessage = function(e){ onChannelMessage(name,e); };
+    c.onclose = function(){ if(name==='message' && api.ready){ api.ready=false; post({t:'rtc',state:'closed'}); } };
+  }
+
+  function handshake(){
+    sendCh('message', JSON.stringify({ type:'Handshake', version:'messageV1', id:'be0bfc6d-1e83-4c8a-90ed-fa8601c5a179', cv:'0' }));
+  }
+
+  function gen(path,data){
+    return JSON.stringify({ type:'Message', content:JSON.stringify(data), id:uuid(), target:path, cv:'' });
+  }
+  function sendConfig(){
+    sendCh('message', gen('/streaming/systemUi/configuration', { version:[0,2,0], systemUis:[] }));
+    sendCh('message', gen('/streaming/properties/clientappinstallidchanged', { clientAppInstallId:'c97d7ee0-73b2-4239-bf1d-9d805a338429' }));
+    sendCh('message', gen('/streaming/characteristics/orientationchanged', { orientation:0 }));
+    sendCh('message', gen('/streaming/characteristics/touchinputenabledchanged', { touchInputEnabled:false }));
+    sendCh('message', gen('/streaming/characteristics/clientdevicecapabilities', {}));
+    sendCh('message', gen('/streaming/characteristics/dimensionschanged', {
+      horizontal:1920, vertical:1080, preferredWidth:1920, preferredHeight:1080,
+      safeAreaLeft:0, safeAreaTop:0, safeAreaRight:1920, safeAreaBottom:1080, supportsCustomResolution:true }));
+  }
+
+  function gamepadChanged(added){
+    sendCh('control', JSON.stringify({ message:'gamepadChanged', gamepadIndex:0, wasAdded:added }));
+  }
+  function controlAuth(){
+    sendCh('control', JSON.stringify({ message:'authorizationRequest', accessKey:'4BDB3609-C1F1-4195-9B37-FEFF45DA8B8E' }));
+    gamepadChanged(true);
+    gamepadChanged(false);
+    setTimeout(function(){ gamepadChanged(true); }, 300);
+    if(kf) clearInterval(kf);
+    kf = setInterval(function(){
+      sendCh('control', JSON.stringify({ message:'videoKeyframeRequested', ifrRequested:true }));
+    }, 5000);
+  }
+
+  function inputStart(){
+    var dv = new DataView(new ArrayBuffer(15));
+    dv.setUint16(0, 8, true);            // ClientMetadata
+    dv.setUint32(2, 0, true);
+    dv.setFloat64(6, performance.now(), true);
+    dv.setUint8(14, 1);                  // max touch points
+    sendCh('input', dv);
+  }
+
+  function afterHandshake(){
+    controlAuth();
+    inputStart();
+    sendConfig();
+    api.ready = true;
+    post({t:'rtc', state:'ready'});
+  }
+
+  function complete(id,data){
+    sendCh('message', JSON.stringify({ type:'TransactionComplete', content:JSON.stringify(data), id:id, cv:'' }));
+  }
+
+  function onChannelMessage(name,e){
+    if(name === 'message'){
+      var d = e.data;
+      if(typeof d !== 'string'){ try{ d = new TextDecoder().decode(d); }catch(x){ return; } }
+      var m; try{ m = JSON.parse(d); }catch(x){ return; }
+      if(m.type === 'HandshakeAck'){ afterHandshake(); }
+      else if(m.type === 'TransactionStart' || m.type === 'Message'){
+        if(m.target === '/streaming/sessionLifetimeManagement/serverInitiatedDisconnect'){
+          complete(m.id,''); api.ready=false; post({t:'rtc',state:'closed'});
+        } else if(m.target === '/streaming/systemUi/messages/ShowMessageDialog'){
+          complete(m.id,{ Result:0 });
+        }
+      }
+    } else if(name === 'input'){
+      try{
+        var dv = new DataView(e.data);
+        if(dv.getUint8(0) === 128){      // rumble report -> vibrate the phone
+          var l = dv.getUint8(4), r = dv.getUint8(5);
+          var p = Math.max(l,r), now = Date.now();
+          if(p > 0 && now-lastBuzz > 80){
+            lastBuzz = now;
+            var dur = dv.getUint16(8,true);
+            post({t:'buzz', ms: Math.min(300, Math.max(20, dur||40))});
+          }
+        }
+      }catch(x){}
+    }
+  }
+
+  function ax(v){ var n = Math.round(v*32767); return n>32767?32767:(n<-32767?-32767:n); }
+  var BITS = { Nexus:2, Menu:4, View:8, A:16, B:32, X:64, Y:128, Up:256, Down:512, Left:1024, Right:2048,
+               LB:4096, RB:8192, L3:16384, R3:32768 };
+
+  api.sendState = function(s){
+    var c = ch.input;
+    if(!c || c.readyState !== 'open') return;
+    var mask = 0;
+    for(var k in BITS){ if(s.buttons[k]) mask |= BITS[k]; }
+    var dv = new DataView(new ArrayBuffer(38));
+    seq++;
+    dv.setUint16(0, 2, true);               // Gamepad report
+    dv.setUint32(2, seq, true);
+    dv.setFloat64(6, performance.now(), true);
+    dv.setUint8(14, 1);                     // one frame
+    dv.setUint8(15, 0);                     // gamepad index
+    dv.setUint16(16, mask, true);
+    dv.setInt16(18, ax(s.axes[0]), true);   // left X
+    dv.setInt16(20, ax(-s.axes[1]), true);  // left Y (up = positive on the wire)
+    dv.setInt16(22, ax(s.axes[2]), true);   // right X
+    dv.setInt16(24, ax(-s.axes[3]), true);  // right Y
+    dv.setUint16(26, s.triggers[0] ? 65535 : 0, true);
+    dv.setUint16(28, s.triggers[1] ? 65535 : 0, true);
+    dv.setUint32(30, 1, true);
+    dv.setUint32(34, 1, false);
+    try{ c.send(dv); }catch(e){}
+  };
+
+  api.start = function(){
+    api.stop();
+    cand = []; seq = 0;
+    pc = new RTCPeerConnection({});
+    pc.addTransceiver('audio', { direction:'sendrecv' });
+    var vt = pc.addTransceiver('video', { direction:'recvonly' });
+    try{ var pref = codecPrefs(); if(pref.length) vt.setCodecPreferences(pref); }catch(e){}
+    pc.onicecandidate = function(e){ if(e.candidate) cand.push(e.candidate); };
+    pc.onconnectionstatechange = function(){
+      var st = pc.connectionState;
+      if(st === 'failed' || st === 'closed' || st === 'disconnected'){ api.ready=false; }
+      post({t:'rtc', state: st});
+    };
+    pc.ontrack = function(){};
+    open('chat',    { ordered:true, protocol:'chatV1' });
+    open('control', { ordered:true, protocol:'controlV1' });
+    open('input',   { ordered:true, protocol:'1.0' });
+    open('message', { ordered:true, protocol:'messageV1' });
+    pc.createOffer({ offerToReceiveAudio:true, offerToReceiveVideo:true }).then(function(o){
+      var offer = { type:o.type, sdp:tune(o.sdp) };
+      return pc.setLocalDescription(offer).then(function(){ post({t:'offer', sdp:offer.sdp}); });
+    }).catch(function(e){ post({t:'rtcerr', msg:String(e)}); });
+  };
+
+  api.setAnswer = function(sdp){
+    pc.setRemoteDescription({ type:'answer', sdp:sdp }).catch(function(e){ post({t:'rtcerr', msg:'answer: '+String(e)}); });
+  };
+
+  api.sendIce = function(ip){
+    var t0 = Date.now();
+    (function wait(){
+      if(pc.iceGatheringState === 'complete' || Date.now()-t0 > 2500){
+        var out = cand.map(function(c){
+          var j = c.toJSON();
+          if(ip && j.candidate){
+            var p = j.candidate.split(' ');
+            if(p.length > 4 && /\.local$/.test(p[4])){ p[4] = ip; j.candidate = p.join(' '); }
+          }
+          return j;
+        });
+        post({t:'ice', candidates:out});
+      } else { setTimeout(wait,100); }
+    })();
+  };
+
+  api.addIce = function(list){
+    (list||[]).forEach(function(c){
+      if(!c || !c.candidate || c.candidate === 'a=end-of-candidates') return;
+      pc.addIceCandidate({ candidate:c.candidate, sdpMid:c.sdpMid, sdpMLineIndex:c.sdpMLineIndex }).catch(function(){});
+    });
+  };
+
+  api.stop = function(){
+    api.ready = false;
+    if(kf){ clearInterval(kf); kf = null; }
+    for(var k in ch){ try{ ch[k].close(); }catch(e){} }
+    ch = {};
+    if(pc){ try{ pc.close(); }catch(e){} pc = null; }
+  };
+
+  return api;
+})();
 </script>
 </body>
 </html>`;
