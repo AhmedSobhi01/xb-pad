@@ -300,7 +300,7 @@ export class XhomeApi {
       }
       await sleep(1000);
     }
-    throw new Error('مفيش رد من الـ Xbox على ICE [' + last + '] [أرسلنا ' + candidates.length + ']');
+    throw new Error('مفيش رد من الـ Xbox على ICE [' + last + '] [أرسلنا: ' + candidates.map(c => (c.candidate || '').split(' ').slice(4, 6).join(':')).join(' , ') + ']');
   }
 
   keepalive(path) {
